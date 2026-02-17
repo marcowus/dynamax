@@ -3,22 +3,21 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import jax.random as jr
-import matplotlib.pyplot as plt
+import optax
+import time
 import pandas as pd
 import json
 import os
-import time
 from tqdm import tqdm
 
-import optax
 from dynamax.linear_gaussian_ssm import LinearGaussianSSM
 from dynamax.parameters import ParameterProperties
 from dynamax.utils.bijectors import RealToPSDBijector
 from dynamax.linear_gaussian_ssm.inference import ParamsLGSSM, ParamsLGSSMInitial, ParamsLGSSMDynamics, ParamsLGSSMEmissions
-from gpe_lib import generate_gpe_input, generate_baseline_input
+
+from gpe_lib import generate_baseline_input
 from utils import compute_gram_matrix, compute_spectral_metrics, compute_parameter_error, compute_coverage_metric
 
-# Configuration
 CONFIG = {
     "state_dim": 4,
     "emission_dim": 2,
@@ -26,35 +25,31 @@ CONFIG = {
     "noise_scale_Q": 0.1,
     "noise_scale_R": 0.1,
     "T_list": [200, 500, 1000],
-    "L": 10, # Hold length
+    "L": 10,
     "step_limit_deg": 45,
-    "methods": ["gpe", "white_noise", "multi_sine"],
+    "methods": ["gpe", "white_noise", "multi_sine", "piecewise_gaussian", "sphere_random_walk"],
     "n_seeds": 5,
     "sgd_epochs": 100,
     "learning_rate": 0.01,
-    "amplitude": 1.0
+    "u_max": 1.0,
+    "amplitude": 1.0,
+    "T_test": 1000
 }
 
-def create_true_model(key, config):
+def create_stable_true_model(key, config):
     state_dim = config["state_dim"]
     emission_dim = config["emission_dim"]
     input_dim = config["input_dim"]
 
     model = LinearGaussianSSM(state_dim, emission_dim, input_dim)
+    params, _ = model.initialize(key)
 
-    # Initialize with random parameters
-    # We want a stable system
-    key, subkey = jr.split(key)
-    params, props = model.initialize(subkey)
-
-    # Force stability on F (dynamics weights)
-    # Eigvals < 1
+    # Enforce stability: spectral radius <= 0.95
     F = params.dynamics.weights
-    u, s, vt = jnp.linalg.svd(F)
-    s = jnp.clip(s, 0, 0.95)
-    F_stable = u @ jnp.diag(s) @ vt
+    eigvals = jnp.linalg.eigvals(F)
+    rho = jnp.max(jnp.abs(eigvals))
+    F_stable = F * (0.95 / (rho + 1e-6))
 
-    # Adjust noise scales
     Q = jnp.eye(state_dim) * config["noise_scale_Q"]**2
     R = jnp.eye(emission_dim) * config["noise_scale_R"]**2
 
@@ -73,73 +68,125 @@ def create_true_model(key, config):
             cov=R
         )
     )
-
     return model, new_params
 
-def run_trial(seed, model, true_params, method, T, config):
-    key = jr.PRNGKey(seed)
+def check_constraints(inputs, config, method):
+    # Check u_max
+    norms = jnp.linalg.norm(inputs, axis=1)
+    max_norm = jnp.max(norms)
+    if max_norm > config["u_max"] + 1e-4:
+        print(f"WARNING: Method {method} violated u_max: {max_norm} > {config['u_max']}")
 
+    # Check step constraint for GPE and sphere_random_walk
+    if method in ["gpe", "sphere_random_walk"]:
+        u_curr = inputs[:-1]
+        u_next = inputs[1:]
+        # Normalize to check angle on sphere (if they are roughly unit norm)
+        # But inputs are scaled by amplitude.
+        # Check angle between consecutive vectors
+        # If u is zero vector, angle is undefined (or 0).
+        norms_curr = jnp.linalg.norm(u_curr, axis=1, keepdims=True)
+        norms_next = jnp.linalg.norm(u_next, axis=1, keepdims=True)
+
+        valid = (norms_curr.squeeze() > 1e-6) & (norms_next.squeeze() > 1e-6)
+        if jnp.any(valid):
+            u_c = u_curr[valid] / norms_curr[valid]
+            u_n = u_next[valid] / norms_next[valid]
+            dots = jnp.sum(u_c * u_n, axis=1)
+            angles = jnp.arccos(jnp.clip(dots, -1.0, 1.0))
+            max_angle = jnp.max(angles)
+
+            limit_rad = jnp.deg2rad(config["step_limit_deg"])
+            # Note: We sub-sample every L steps? No, check every step.
+            # But GPE holds for L steps. So angle is 0 for L-1 steps.
+            # Only transitions matter.
+
+            if max_angle > limit_rad + 1e-2:
+                print(f"WARNING: Method {method} violated step constraint: {jnp.rad2deg(max_angle)} > {config['step_limit_deg']}")
+
+def run_single_trial(
+    method, T, config,
+    model, true_params, init_params, props,
+    test_emissions, test_inputs,
+    rng_input, rng_sample, rng_train
+):
     # 1. Generate Inputs
-    key, subkey = jr.split(key)
-    if method == "gpe":
-        inputs = generate_gpe_input(
-            subkey,
-            config["input_dim"],
-            T,
-            config["L"],
-            config["step_limit_deg"],
-            amplitude=config["amplitude"]
-        )
-    else:
-        inputs = generate_baseline_input(
-            subkey,
-            config["input_dim"],
-            T,
-            method,
-            amplitude=config["amplitude"]
-        )
+    inputs = generate_baseline_input(
+        rng_input,
+        config["input_dim"],
+        T,
+        method,
+        amplitude=config["amplitude"],
+        u_max=config["u_max"],
+        L=config["L"],
+        step_limit_deg=config["step_limit_deg"]
+    )
 
-    # 2. Sample Data
-    key, subkey = jr.split(key)
-    states, emissions = model.sample(true_params, subkey, T, inputs=inputs)
+    # Verify constraints
+    check_constraints(inputs, config, method)
 
-    # 3. Compute Input Metrics (Gram, etc)
+    # 2. Sample Train Data
+    _, train_emissions = model.sample(true_params, rng_sample, T, inputs=inputs)
+
+    # 3. Compute Input Metrics
     gram = compute_gram_matrix(inputs)
     spec_metrics = compute_spectral_metrics(gram)
 
-    # 4. Train Model
-    # Initialize random model but FREEZE everything except B and D to True values
-    # This ensures identifiability and stability.
-    key, subkey = jr.split(key)
+    # Coverage on segments (every L steps)
+    inputs_sub = inputs[::config["L"]]
+    cov_metric = compute_coverage_metric(inputs_sub)
 
-    # Use standard model for SGD
-    learner_model = LinearGaussianSSM(
-        config["state_dim"], config["emission_dim"], config["input_dim"]
+    # 4. Train (SGD)
+    start_time = time.time()
+    optimizer = optax.adam(learning_rate=config["learning_rate"])
+    learned_params, losses = model.fit_sgd(
+        init_params,
+        props,
+        train_emissions,
+        inputs=inputs,
+        optimizer=optimizer,
+        num_epochs=config["sgd_epochs"],
+        batch_size=1, # SGD
+        key=rng_train
     )
+    train_time = time.time() - start_time
 
-    # Initialize random params first
-    random_params, _ = learner_model.initialize(subkey)
+    # 5. Metrics
+    param_errors = compute_parameter_error(true_params, learned_params)
 
-    # Construct init_params: Use TRUE params for F, H, Q, R, m, S
-    # Use RANDOM params for B, D
-    init_params = ParamsLGSSM(
-        initial=true_params.initial,
-        dynamics=ParamsLGSSMDynamics(
-            weights=true_params.dynamics.weights,
-            bias=true_params.dynamics.bias,
-            input_weights=random_params.dynamics.input_weights, # Learn this
-            cov=true_params.dynamics.cov
-        ),
-        emissions=ParamsLGSSMEmissions(
-            weights=true_params.emissions.weights,
-            bias=true_params.emissions.bias,
-            input_weights=random_params.emissions.input_weights, # Learn this
-            cov=true_params.emissions.cov
-        )
-    )
+    # NLLs
+    train_nll = -model.marginal_log_prob(learned_params, train_emissions, inputs=inputs) / T
+    test_nll = -model.marginal_log_prob(learned_params, test_emissions, inputs=test_inputs) / config["T_test"]
 
-    # Construct Properties to freeze everything except input_weights
-    props = ParamsLGSSM(
+    return {
+        "method": method,
+        "T": T,
+        "min_eig": spec_metrics["min_eig"],
+        "condition_number": spec_metrics["condition_number"],
+        "segment_coverage": cov_metric,
+        "err_B": param_errors["err_B"],
+        "err_D": param_errors["err_D"],
+        "train_nll": float(train_nll),
+        "test_nll": float(test_nll),
+        "train_time": train_time
+    }
+
+def main():
+    os.makedirs("gpe_project/plots", exist_ok=True)
+    os.makedirs("gpe_project/data", exist_ok=True)
+
+    results = []
+
+    # JIT Warmup (dummy run)
+    print("Warming up JIT...")
+    dummy_key = jr.PRNGKey(999)
+    dummy_model, dummy_params = create_stable_true_model(dummy_key, CONFIG)
+    dummy_inputs = jnp.zeros((100, 2))
+    _, dummy_emissions = dummy_model.sample(dummy_params, dummy_key, 100, inputs=dummy_inputs)
+    dummy_optimizer = optax.adam(0.01)
+
+    # We need ParameterProperties structure, not just params
+    dummy_props = ParamsLGSSM(
         initial=ParamsLGSSMInitial(
             mean=ParameterProperties(trainable=False),
             cov=ParameterProperties(trainable=False, constrainer=RealToPSDBijector())
@@ -158,149 +205,132 @@ def run_trial(seed, model, true_params, method, T, config):
         )
     )
 
-    # Run SGD
-    start_time = time.time()
-    optimizer = optax.adam(learning_rate=config["learning_rate"])
-    learned_params, losses = learner_model.fit_sgd(
-        init_params,
-        props,
-        emissions,
-        inputs=inputs,
-        optimizer=optimizer,
-        num_epochs=config["sgd_epochs"],
-        batch_size=1
-    )
-    lls = -losses # approximate LL (scaled)
-    train_time = time.time() - start_time
-
-    # 5. Compute Error Metrics
-    param_errors = compute_parameter_error(true_params, learned_params)
-
-    # 6. Final Result
-    return {
-        "method": method,
-        "seed": seed,
-        "T": T,
-        "min_eig": spec_metrics["min_eig"],
-        "condition_number": spec_metrics["condition_number"],
-        "err_B": param_errors["err_B"],
-        "err_D": param_errors["err_D"],
-        "err_F": param_errors["err_F"],
-        "final_ll": float(lls[-1]),
-        "train_time": train_time,
-        "ll_curve": [float(x) for x in lls]
-    }
-
-def main():
-    # Create output directory
-    os.makedirs("gpe_project/plots", exist_ok=True)
-    os.makedirs("gpe_project/data", exist_ok=True)
-
-    # Setup True Model (Fixed for all trials to ensure comparability of "Parameter Error")
-    # Actually, usually we want to average over random models too.
-    # But for "Parameter Error", we need ground truth.
-    # We will instantiate ONE true model structure, but maybe vary it per seed?
-    # Better: Use same true model for all methods within a seed.
-
-    results = []
+    dummy_model.fit_sgd(dummy_params, dummy_props, dummy_emissions, inputs=dummy_inputs, optimizer=dummy_optimizer, num_epochs=1, batch_size=1)
+    print("Warmup complete.")
 
     print("Starting Experiments...")
 
-    # Loop over T
-    for T in CONFIG["T_list"]:
-        print(f"  Testing T = {T}")
+    for seed in tqdm(range(CONFIG["n_seeds"]), desc="Seeds"):
+        master_key = jr.PRNGKey(seed)
 
-        # Loop over Seeds (Random Instantiations of Truth + Noise)
-        for seed in tqdm(range(CONFIG["n_seeds"])):
-            # Generate True Model for this seed
-            model_key = jr.PRNGKey(seed) # Use seed for model gen
-            model, true_params = create_true_model(model_key, CONFIG)
+        # Split keys for strict fairness
+        # 1. System Key (True Model)
+        # 2. Test Data Key (Test Inputs & Noise)
+        # 3. Init Key (Initialization of Learner)
+        # 4. Method Keys (One per method per T) - derived later
+        key_sys, key_test, key_init = jr.split(master_key, 3)
 
-            # Loop over Methods
+        # Create True System
+        model, true_params = create_stable_true_model(key_sys, CONFIG)
+
+        # Create Common Test Set
+        # Use white noise for test set to check generalization
+        test_inputs = generate_baseline_input(
+            key_test, CONFIG["input_dim"], CONFIG["T_test"],
+            "white_noise", amplitude=CONFIG["amplitude"], u_max=CONFIG["u_max"]
+        )
+        _, test_emissions = model.sample(true_params, key_test, CONFIG["T_test"], inputs=test_inputs)
+
+        # Create Common Initialization (Frozen except B, D)
+        # Initialize random params
+        random_params, _ = model.initialize(key_init)
+
+        # Construct init_params: Use TRUE params for F, H, Q, R, m, S; RANDOM for B, D
+        init_params = ParamsLGSSM(
+            initial=true_params.initial,
+            dynamics=ParamsLGSSMDynamics(
+                weights=true_params.dynamics.weights,
+                bias=true_params.dynamics.bias,
+                input_weights=random_params.dynamics.input_weights, # Learn this
+                cov=true_params.dynamics.cov
+            ),
+            emissions=ParamsLGSSMEmissions(
+                weights=true_params.emissions.weights,
+                bias=true_params.emissions.bias,
+                input_weights=random_params.emissions.input_weights, # Learn this
+                cov=true_params.emissions.cov
+            )
+        )
+
+        # Props: Freeze everything except input_weights
+        props = ParamsLGSSM(
+            initial=ParamsLGSSMInitial(
+                mean=ParameterProperties(trainable=False),
+                cov=ParameterProperties(trainable=False, constrainer=RealToPSDBijector())
+            ),
+            dynamics=ParamsLGSSMDynamics(
+                weights=ParameterProperties(trainable=False),
+                bias=ParameterProperties(trainable=False),
+                input_weights=ParameterProperties(trainable=True),
+                cov=ParameterProperties(trainable=False, constrainer=RealToPSDBijector())
+            ),
+            emissions=ParamsLGSSMEmissions(
+                weights=ParameterProperties(trainable=False),
+                bias=ParameterProperties(trainable=False),
+                input_weights=ParameterProperties(trainable=True),
+                cov=ParameterProperties(trainable=False, constrainer=RealToPSDBijector())
+            )
+        )
+
+        # Iterate T
+        for T in CONFIG["T_list"]:
+            # Iterate Methods
             for method in CONFIG["methods"]:
-                # Use a specific key for the trial that mixes seed and method
-                # But actually, we want the NOISE to be same for fair comparison?
-                # Ideally: Same true params, same noise realization (w_t, v_t), ONLY inputs differ.
-                # `run_trial` generates inputs then samples.
-                # To control noise realization, we should pass the key for sampling.
-                # Currently `run_trial` splits `key` derived from `seed`.
-                # If we pass same `seed` to `run_trial`, it generates same sampling key?
-                # Wait, `run_trial` generates inputs first (consuming a split), then samples.
-                # If generation consumes different number of random calls, sampling key will drift.
-                # FIX: Pass specific keys for input_gen and sampling.
+                # Unique key for this trial's input generation & training noise
+                # Combine seed, T, method
+                # We use fold_in for robust derivation
+                trial_id = hash(f"{seed}_{T}_{method}") & 0xFFFFFFFF
+                trial_key = jr.fold_in(master_key, trial_id)
+                rng_input, rng_sample, rng_train = jr.split(trial_key, 3)
 
-                trial_key = jr.PRNGKey(seed)
-                key_input, key_sample, key_init = jr.split(trial_key, 3)
-
-                # We need to manually inject these keys into run_trial or modifying run_trial to take keys.
-                # Let's modify run_trial call below to pass keys if we want strict control.
-                # For now, let's just accept random variation.
-                # With N_seeds=20, it averages out. With N=5, might be noisy.
-                # But let's try to keep it simple.
-
-                res = run_trial(seed, model, true_params, method, T, CONFIG)
+                res = run_single_trial(
+                    method, T, CONFIG,
+                    model, true_params, init_params, props,
+                    test_emissions, test_inputs,
+                    rng_input, rng_sample, rng_train
+                )
+                res["seed"] = seed
                 results.append(res)
 
-    # Save results
+    # Save Results
     df = pd.DataFrame(results)
     df.to_csv("gpe_project/data/results.csv", index=False)
 
-    with open("gpe_project/data/results.json", "w") as f:
-        # Convert df to dict, handle list in 'll_curve'
-        json.dump(results, f, indent=2)
-
-    print("Experiments Complete. Generating Plots...")
+    print("Generating Plots...")
     generate_plots(df)
 
 def generate_plots(df):
     import seaborn as sns
+    import matplotlib.pyplot as plt
+
     sns.set_style("whitegrid")
 
-    # 1. Error B vs T
+    # 1. Test NLL vs T
     plt.figure(figsize=(10, 6))
-    sns.lineplot(data=df, x="T", y="err_B", hue="method", marker="o")
-    plt.title("Parameter Estimation Error (B) vs Sample Size T")
-    plt.ylabel("Frobenius Norm Error ||B_hat - B_true||")
+    sns.lineplot(data=df, x="T", y="test_nll", hue="method", marker="o", errorbar="sd")
+    plt.title("Test Negative Log Likelihood vs Training Size")
+    plt.ylabel("Test NLL (lower is better)")
+    plt.savefig("gpe_project/plots/test_nll_vs_T.png")
+    plt.close()
+
+    # 2. Error B vs T
+    plt.figure(figsize=(10, 6))
+    sns.lineplot(data=df, x="T", y="err_B", hue="method", marker="o", errorbar="sd")
+    plt.title("Parameter Estimation Error (B) vs Training Size")
+    plt.ylabel("||B_hat - B_true||_F")
     plt.savefig("gpe_project/plots/error_B_vs_T.png")
     plt.close()
 
-    # 2. Min Eigenvalue vs T
+    # 3. Segment Coverage vs Min Eig
     plt.figure(figsize=(10, 6))
-    sns.lineplot(data=df, x="T", y="min_eig", hue="method", marker="o")
-    plt.title("Gram Matrix Min Eigenvalue vs T")
-    plt.ylabel("min(eig(U_T))")
-    plt.savefig("gpe_project/plots/min_eig_vs_T.png")
+    sns.scatterplot(data=df, x="segment_coverage", y="min_eig", hue="method", style="T")
+    plt.title("Excitation Quality: Spectral Gap vs Geometric Coverage")
+    plt.xlabel("Segment Coverage (Angle of largest hole)")
+    plt.ylabel("Min Eigenvalue (Information)")
+    plt.savefig("gpe_project/plots/eig_vs_coverage.png")
     plt.close()
 
-    # 3. Error vs Min Eig (Scatter)
-    plt.figure(figsize=(10, 6))
-    sns.scatterplot(data=df, x="min_eig", y="err_B", hue="method", style="T")
-    plt.xscale("log")
-    plt.yscale("log")
-    plt.title("Error vs Information (Spectral Lower Bound)")
-    plt.xlabel("Min Eigenvalue (Information)")
-    plt.ylabel("Error (B)")
-    plt.savefig("gpe_project/plots/error_vs_eig.png")
-    plt.close()
-
-    # 4. Convergence Curve (LL) - Take one example (T=max, Seed=0)
-    # Filter for T=max, seed=0
-    T_max = max(df["T"].unique())
-    subset = df[(df["T"] == T_max) & (df["seed"] == 0)]
-
-    plt.figure(figsize=(10, 6))
-    for idx, row in subset.iterrows():
-        ll_curve = row["ll_curve"]
-        plt.plot(ll_curve, label=f"{row['method']}")
-
-    plt.title(f"Log Likelihood Convergence (T={T_max}, Seed=0)")
-    plt.xlabel("EM Iteration")
-    plt.ylabel("Marginal Log Likelihood")
-    plt.legend()
-    plt.savefig("gpe_project/plots/ll_convergence.png")
-    plt.close()
-
-    print("Plots saved to gpe_project/plots/")
+    print("Plots saved.")
 
 if __name__ == "__main__":
     main()
