@@ -44,28 +44,20 @@ def generate_inputs_gpe(
 
     rho_history = []
 
-    while len(S) < num_cover_points:
-        # Check coverage (expensive, maybe only check periodically or at end?
-        # But we need to know when to stop if eps_cov is reached)
-        # Actually, the farthest_point function gives us the 'worst' dot product implicitly.
-        # But to be precise about rho(S), let's just run the loop until num_cover_points
-        # OR check max_angle from farthest_point.
+    # Calculate max possible segments given T and L
+    max_dirs = int(jnp.ceil(T / segment_length))
+
+    # Stop if we hit segment budget OR coverage budget
+    while len(traj_dirs) < max_dirs and len(S) < num_cover_points:
 
         key, subkey = jr.split(key)
         # Convert S to array for JAX ops
         S_arr = jnp.array(S)
 
         # 1. Greedy Step: Find farthest point
-        # farthest_point_from_set returns v_star and max_dot (cos of min angle)
-        # We want to minimize max_dot => maximize angle.
-        # Wait, farthest_point_from_set returns (v_star, best_dot).
-        # best_dot = max_{s in S} v_star^T s.
-        # This is exactly what we want to minimize (the coverage hole size).
         v_star, best_dot = farthest_point_from_set(S_arr, subkey, num_candidates)
 
         # Check termination condition based on coverage
-        # The coverage radius is approx arccos(best_dot_of_worst_point).
-        # If best_dot is high, the hole is small.
         current_gap = jnp.arccos(jnp.clip(best_dot, -1.0, 1.0))
         rho_history.append(float(current_gap))
 
@@ -78,14 +70,21 @@ def generate_inputs_gpe(
 
         if angle > eps_step:
             n_steps = int(jnp.ceil(angle / eps_step))
+            # Fixed-start slerp to avoid drift
+            s0 = s_cur
             for i in range(1, n_steps + 1):
+                # Check budget
+                if len(traj_dirs) >= max_dirs:
+                    break
+
                 t = i / n_steps
-                s_next = slerp(s_cur, v_star, t)
+                s_next = slerp(s0, v_star, t)
                 # Normalize again to be safe
                 s_next = s_next / (jnp.linalg.norm(s_next) + 1e-8)
 
                 traj_dirs.append(s_next)
                 S.append(s_next)
+                # Only update s_cur after full segment is done or if loop breaks
                 s_cur = s_next
         else:
             # Just add the point

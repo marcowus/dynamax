@@ -13,44 +13,47 @@ from experiments_gpe.methods.gpe import generate_inputs_gpe
 from experiments_gpe.metrics.coverage import coverage_radius_dot
 from experiments_gpe.metrics.gram import gram_matrix, eig_min_cond, energy, smoothness_l2, max_step_angle
 from experiments_gpe.metrics.learning import compute_parameter_errors
+from experiments_gpe.utils.math import clip_norm
 
 def generate_inputs(method_cfg, T, input_dim, segment_length, u_max, key):
     name = method_cfg['name']
+
     if name == 'gpe':
         u, info = generate_inputs_gpe(
             key, T, input_dim, segment_length, u_max, **method_cfg
         )
-        return u, info
     elif name == 'gaussian_white':
         sigma = method_cfg.get('sigma', 1.0)
         u = generate_gaussian_white(key, T, input_dim, sigma)
-        # Scale by u_max? Usually white noise is just sigma.
-        # But for fair comparison maybe clip or scale?
-        # Prompt says "amplitude: 1.0 # Input amplitude (multiplied by u_max)" for GPE.
-        # For gaussian, let's just use sigma.
-        # But if u_max is hard constraint, we might want to clip.
-        # Let's assume u_max is just a scale factor for GPE.
-        return u, {}
+        info = {}
     elif name == 'multisine':
         u = generate_multisine(key, T, input_dim, **{k:v for k,v in method_cfg.items() if k!='name'})
-        # Multisine returns approx [-1, 1]. Scale by u_max.
         u = u * u_max
-        return u, {}
+        info = {}
     else:
         raise ValueError(f"Unknown method: {name}")
+
+    # Enforce global clip norm constraint for fair comparison
+    u = clip_norm(u, u_max)
+    return u, info
 
 def run_experiment(cfg):
     print(f"Running experiment: {cfg['experiment']['name']}")
 
     # Global seed
     seed = cfg['experiment']['seed']
-    key = jr.PRNGKey(seed)
+    base_key = jr.PRNGKey(seed)
+
+    # Standardized keys for fairness
+    # sys_key: for true system parameters (shared across all methods)
+    # init_key: for model initialization (shared across all methods)
+    # test_key: for generating test data (shared across all methods)
+    sys_key  = jr.fold_in(base_key, 0)
+    init_key = jr.fold_in(base_key, 1)
+    test_key = jr.fold_in(base_key, 2)
 
     # Model Setup
     model = make_lgssm(cfg['model'])
-
-    # Shared System Key (for True Params)
-    key, sys_key = jr.split(key)
 
     results_dir = cfg['experiment']['output_dir']
     os.makedirs(results_dir, exist_ok=True)
@@ -67,15 +70,18 @@ def run_experiment(cfg):
         method_dir = os.path.join(results_dir, method_name)
         os.makedirs(method_dir, exist_ok=True)
 
+        # Method key for input generation
+        method_seed_int = abs(hash(method_name)) & 0xffffffff
+        method_key = jr.fold_in(base_key, method_seed_int)
+
         # 1. Generate Inputs
-        key, input_key = jr.split(key)
         T = cfg['data']['T']
         segment_length = cfg['data']['segment_length']
         u_max = cfg['data']['u_max']
         input_dim = cfg['model']['input_dim']
 
         start_time = time.time()
-        u, info = generate_inputs(method_cfg, T, input_dim, segment_length, u_max, input_key)
+        u, info = generate_inputs(method_cfg, T, input_dim, segment_length, u_max, method_key)
         gen_time = time.time() - start_time
 
         # 2. Sample True System (y)
@@ -83,8 +89,12 @@ def run_experiment(cfg):
         true_params, z_true, y_obs = sample_true_system(model, cfg['data'], sys_key, u)
 
         # 3. Fit Model
-        key, init_key, fit_key = jr.split(key, 3)
+        # Use fixed init_key for initialization across methods
         trainable_paths = cfg['train']['trainable_paths']
+        # Fit key can be random or fixed? Usually random for SGD is fine, but init_params must be same.
+        # We use a derived key for SGD randomness
+        fit_key = jr.fold_in(base_key, 3)
+
         init_params, props = init_learn_params(model, init_key, trainable_paths)
 
         start_time = time.time()
@@ -100,20 +110,17 @@ def run_experiment(cfg):
         max_ang = max_step_angle(u)
 
         # Coverage
-        key, cov_key = jr.split(key)
-        # Coverage of what? The directions in u.
-        # Extract unique directions or just normalize u rows?
-        # u is (T, d).
-        # Normalize rows
+        cov_key = jr.fold_in(base_key, 4)
+
+        # Full coverage (all points)
         u_norm = u / (jnp.linalg.norm(u, axis=1, keepdims=True) + 1e-8)
-        # Use simple sampling of u rows?
-        # If GPE, info['directions'] has the covering set.
-        # But for fair comparison, we should evaluate coverage of the generated u.
-        # If u has constant segments, many rows are identical.
-        # Let's take unique rows? (Might be slow).
-        # Just pass all rows (coverage_radius_dot handles N points).
-        # For 1000 points it's fast.
         rho_hat, _, _ = coverage_radius_dot(u_norm, cov_key, num_probe=method_cfg.get('probe_points', 8192))
+
+        # Segment coverage (fair comparison for stepped inputs)
+        # Take every L-th point
+        u_seg = u[::segment_length]
+        u_seg_norm = u_seg / (jnp.linalg.norm(u_seg, axis=1, keepdims=True) + 1e-8)
+        rho_hat_seg, _, _ = coverage_radius_dot(u_seg_norm, cov_key, num_probe=method_cfg.get('probe_points', 8192))
 
         # Parameter Errors
         errors = compute_parameter_errors(fitted_params, true_params)
@@ -124,26 +131,28 @@ def run_experiment(cfg):
             "gen_time": gen_time,
             "fit_time": fit_time,
             "rho_hat": float(rho_hat),
+            "rho_hat_segment": float(rho_hat_seg),
             "lambda_min_U": float(lam_min),
             "cond_U": float(cond),
             "energy": float(E),
             "smoothness": float(smooth),
             "max_step_angle": float(max_ang),
+            "max_norm": float(jnp.max(jnp.linalg.norm(u, axis=1))),
             "final_loss": float(history[-1]) if len(history) > 0 else None,
             **errors
         }
 
         if 'rho_history' in info:
-             # Just save last or summary?
-             # It's in info, specific to GPE.
              pass
 
         save_json(os.path.join(method_dir, 'run.json'), metrics)
 
         # Save Arrays
+        # Also save u_seg for visualization
         save_npz(
             os.path.join(method_dir, 'arrays.npz'),
             u=u,
+            u_seg=u_seg,
             y=y_obs,
             z=z_true,
             history=history,
