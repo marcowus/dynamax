@@ -1,0 +1,48 @@
+experiment:
+  name: "lgssm_gpe_demo"
+  output_dir: "experiments_gpe/outputs/lgssm_gpe_demo"
+  seed: 0
+
+model:
+  type: "lgssm"
+  state_dim: 8
+  emission_dim: 4
+  input_dim: 4
+  has_dynamics_bias: true
+  has_emissions_bias: true
+
+data:
+  T: 1000
+  segment_length: 10
+  u_max: 1.0
+  # True noise scales (for generating data)
+  Q_scale: 0.1
+  R_scale: 0.1
+
+train:
+  algorithm: "sgd"         # "em" or "sgd"
+  num_iters: 200           # sgd epochs
+  # Optional: only learn specific parameters (freeze others)
+  trainable_paths:
+    - "dynamics.weights"
+    - "dynamics.input_weights"
+    - "dynamics.cov"
+    - "emissions.weights"
+    - "emissions.input_weights"
+    - "emissions.cov"
+    - "initial.mean"
+
+methods:
+  - name: "gpe"
+    eps_cov: 0.35          # Coverage target (radians)
+    eps_step: 0.17         # Max angle between adjacent directions (radians)
+    num_cover_points: 256  # Expected number of direction points (approximate epsilon-net size)
+    num_candidates: 8192   # Number of candidates for farthest-point sampling
+    probe_points: 8192     # Number of probes for evaluating rho(S)
+    amplitude: 1.0         # Input amplitude (multiplied by u_max)
+  - name: "gaussian_white"
+    sigma: 1.0
+  - name: "multisine"
+    K: 8
+    w_min: 0.02
+    w_max: 0.30

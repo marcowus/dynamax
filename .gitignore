@@ -14,4 +14,4 @@ dist/
 *-dot
 *.DS_Store
 .vscode/
-.venv
+.venvexperiments_gpe/outputs/
