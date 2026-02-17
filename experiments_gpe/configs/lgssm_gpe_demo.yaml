@@ -46,3 +46,6 @@ methods:
     K: 8
     w_min: 0.02
     w_max: 0.30
+  - name: "piecewise_gaussian"
+  - name: "sphere_random_walk"
+    eps_step: 0.17

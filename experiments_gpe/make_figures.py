@@ -8,6 +8,7 @@ from experiments_gpe.viz.from_run_dir import load_run
 from experiments_gpe.viz.plot_inputs import plot_u_norm, plot_step_angle, plot_u_components
 from experiments_gpe.viz.plot_learning import plot_loss
 from experiments_gpe.viz.plot_coverage import plot_rho_history, plot_direction_embedding
+from experiments_gpe.viz.plot_tradeoff import plot_scatter_tradeoff
 
 def main():
     parser = argparse.ArgumentParser()
@@ -162,6 +163,55 @@ def main():
             ax.set_title('Direction Space Coverage (PCA Projection)')
             ax.legend()
             save_fig(fig, os.path.join(output_fig_dir, 'direction_pca'))
+
+    # Figure 5: Test NLL Comparison
+    fig, ax = plt.subplots(figsize=(8, 6))
+    names = []
+    nlls = []
+    colors = []
+
+    for name, d in data.items():
+        if d['metrics'] is None: continue
+        nll = d['metrics'].get('test_nll')
+        if nll is not None:
+            names.append(METHOD_LABELS.get(name, name))
+            nlls.append(nll)
+            colors.append(METHOD_COLORS.get(name, 'gray'))
+
+    if nlls:
+        y_pos = np.arange(len(names))
+        ax.barh(y_pos, nlls, color=colors, alpha=0.7)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(names)
+        ax.set_xlabel('Test Negative Log Likelihood')
+        ax.set_title('Generalization Performance')
+        save_fig(fig, os.path.join(output_fig_dir, 'test_nll_bar'))
+
+    # Figure 6: Trade-off Scatter (NLL vs Smoothness)
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    # Extract data list for scatter
+    scatter_data = []
+    for name, d in data.items():
+        if d['metrics'] is not None:
+            scatter_data.append({
+                'name': name,
+                'metrics': d['metrics']
+            })
+
+    # Plot NLL vs Smoothness
+    # Note: Smoothness is sum of sq diffs. Lower is smoother.
+    # NLL: Lower is better.
+    # We want to see GPE having low NLL and low Smoothness score (meaning smooth).
+
+    # Or NLL vs Max Step Angle
+    plot_scatter_tradeoff(ax, scatter_data, 'max_step_angle', 'test_nll', METHOD_LABELS, METHOD_COLORS)
+    save_fig(fig, os.path.join(output_fig_dir, 'tradeoff_nll_step'))
+
+    # Figure 7: NLL vs Coverage
+    fig, ax = plt.subplots(figsize=(8, 6))
+    plot_scatter_tradeoff(ax, scatter_data, 'rho_hat_segment', 'test_nll', METHOD_LABELS, METHOD_COLORS)
+    save_fig(fig, os.path.join(output_fig_dir, 'tradeoff_nll_coverage'))
 
 if __name__ == "__main__":
     main()

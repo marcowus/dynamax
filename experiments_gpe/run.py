@@ -8,7 +8,12 @@ import time
 from experiments_gpe.utils.config import load_config
 from experiments_gpe.utils.io import save_json, save_npz
 from experiments_gpe.models.lgssm_factory import make_lgssm, sample_true_system, init_learn_params, fit_model
-from experiments_gpe.methods.baselines import generate_gaussian_white, generate_multisine
+from experiments_gpe.methods.baselines import (
+    generate_gaussian_white,
+    generate_multisine,
+    generate_piecewise_gaussian,
+    generate_sphere_random_walk
+)
 from experiments_gpe.methods.gpe import generate_inputs_gpe
 from experiments_gpe.metrics.coverage import coverage_radius_dot
 from experiments_gpe.metrics.gram import gram_matrix, eig_min_cond, energy, smoothness_l2, max_step_angle
@@ -29,6 +34,13 @@ def generate_inputs(method_cfg, T, input_dim, segment_length, u_max, key):
     elif name == 'multisine':
         u = generate_multisine(key, T, input_dim, **{k:v for k,v in method_cfg.items() if k!='name'})
         u = u * u_max
+        info = {}
+    elif name == 'piecewise_gaussian':
+        u = generate_piecewise_gaussian(key, T, input_dim, segment_length)
+        info = {}
+    elif name == 'sphere_random_walk':
+        eps_step = method_cfg.get('eps_step', 0.17)
+        u = generate_sphere_random_walk(key, T, input_dim, segment_length, eps_step=eps_step)
         info = {}
     else:
         raise ValueError(f"Unknown method: {name}")
@@ -60,6 +72,19 @@ def run_experiment(cfg):
 
     # Save config
     save_json(os.path.join(results_dir, 'config.json'), cfg)
+
+    # Generate Public Test Set (Shared)
+    # Use piecewise gaussian for test set as it respects constraints but is random
+    T_test = cfg['data']['T'] # Same length as train? Or can be different.
+    test_segment_length = cfg['data']['segment_length']
+    u_max = cfg['data']['u_max']
+    input_dim = cfg['model']['input_dim']
+
+    u_test = generate_piecewise_gaussian(test_key, T_test, input_dim, test_segment_length)
+    u_test = clip_norm(u_test, u_max)
+
+    # Sample test observations
+    _, _, y_test = sample_true_system(model, cfg['data'], sys_key, u_test)
 
     # Run methods
     for method_cfg in cfg['methods']:
@@ -125,6 +150,10 @@ def run_experiment(cfg):
         # Parameter Errors
         errors = compute_parameter_errors(fitted_params, true_params)
 
+        # Test Set NLL
+        test_mll = model.marginal_log_prob(fitted_params, y_test, inputs=u_test)
+        test_nll = -float(test_mll) / y_test.shape[0] # Average per timestep
+
         # 5. Save Results
         metrics = {
             "method": method_name,
@@ -139,6 +168,7 @@ def run_experiment(cfg):
             "max_step_angle": float(max_ang),
             "max_norm": float(jnp.max(jnp.linalg.norm(u, axis=1))),
             "final_loss": float(history[-1]) if len(history) > 0 else None,
+            "test_nll": test_nll,
             **errors
         }
 

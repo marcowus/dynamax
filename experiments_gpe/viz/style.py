@@ -26,11 +26,15 @@ def save_fig(fig, path_base):
 METHOD_LABELS = {
     'gpe': 'GPE (Ours)',
     'gaussian_white': 'Gaussian White',
-    'multisine': 'Multisine'
+    'multisine': 'Multisine',
+    'piecewise_gaussian': 'Piecewise Gaussian',
+    'sphere_random_walk': 'Sphere Random Walk'
 }
 
 METHOD_COLORS = {
     'gpe': '#d62728',       # Red
     'gaussian_white': '#1f77b4', # Blue
-    'multisine': '#2ca02c'  # Green
+    'multisine': '#2ca02c',  # Green
+    'piecewise_gaussian': '#ff7f0e', # Orange
+    'sphere_random_walk': '#9467bd'  # Purple
 }
